@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="th"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>เข้าร่วมเกม</title><link rel="stylesheet" href="/style.css">
+</head><body data-sfx="top">
+<div class="wrap fit">
+  <div class="top"><img data-logo class="logo" alt="" style="display:none"><h1 data-title></h1></div>
+  <div id="main" class="stack grow"></div>
+</div>
+<script src="/socket.io/socket.io.js"></script>
+<script src="/theme.js"></script>
+<script src="/sfx.js"></script>
+<script src="/fx.js"></script>
+<script>
+const $ = s => document.querySelector(s), main = $('#main');
+const socket = io({ transports: ['websocket', 'polling'], reconnection: true });
+let saved = {}; try { saved = JSON.parse(localStorage.getItem('qp') || '{}'); } catch (e) {}
+let view = null, myAnswer = null, joined = false;
+const urlPin = new URLSearchParams(location.search).get('pin') || '';
+if (urlPin && urlPin !== saved.pin) saved = {};
+applyTheme(null);
+
+function joinScreen(err) {
+  main.innerHTML = `<div class="card stack">
+    <label>รหัส PIN<input id="pin" inputmode="numeric" maxlength="6" autocomplete="off" value="${esc(urlPin || saved.pin || '')}"></label>
+    <label>ชื่อของคุณ<input id="name" maxlength="16" autocomplete="off" value="${esc(saved.name || '')}"></label>
+    <button class="btn big" id="go">เข้าร่วม</button>
+    <div class="err" id="err" style="color:#c0132f">${esc(err || '')}</div></div>`;
+  $('#go').onclick = doJoin;
+  $('#name').onkeydown = e => { if (e.key === 'Enter') doJoin(); };
+}
+function doJoin() {
+  const pin = $('#pin').value.trim(), name = $('#name').value.trim();
+  socket.emit('player:join', { pin, name, pid: saved.pin === pin ? saved.pid : null }, r => {
+    if (!r.ok) { if (saved.pid) saved = {}; return joinScreen(r.error); }
+    saved = { pin, pid: r.pid, name }; localStorage.setItem('qp', JSON.stringify(saved)); joined = true; SFX.unlock(); SFX.join();
+  });
+}
+socket.on('connect', () => {
+  if (saved.pid && saved.pin) {
+    socket.emit('player:join', { pin: saved.pin, pid: saved.pid }, r => { if (r.ok) joined = true; else { saved = {}; joined = false; joinScreen(); } });
+  } else if (!joined) joinScreen();
+});
+
+const buzz = x => { try { navigator.vibrate && navigator.vibrate(x); } catch (e) {} };
+function playerSound(v) {
+  if (v.state === 'intro') SFX.whoosh();
+  else if (v.state === 'reveal') {
+    if (v.result && v.result.correct) { SFX.correct(); buzz([80, 40, 120]); }
+    else { SFX.wrong(); buzz(250); }
+  }
+}
+socket.on('p:view', v => {
+  if (v.theme) applyTheme(v.theme);
+  const changed = !view || view.q !== v.q || view.state !== v.state;
+  if (changed) myAnswer = v.answered;
+  view = v; render();
+  if (changed) playerSound(v);
+});
+
+const tile = (o, img, i) => `<button class="ans ${img ? 'hasimg' : ''}" style="--c:var(--a${i})" data-i="${i}" aria-label="ตัวเลือก ${i + 1}"><span class="sh">${SHAPES[i]}</span>${img ? `<img src="${esc(img)}" alt="">` : ''}${o ? `<span class="t">${esc(o)}</span>` : ''}</button>`;
+let finTimer = null, finFx = false;
+function render() {
+  const v = view; if (!v) return;
+  stopCount(); clearTimeout(finTimer);
+  if (v.state !== 'final') finFx = false;
+  const st = (cls, html) => main.innerHTML = `<div class="status big ${cls}">${html}</div>`;
+  if (v.state === 'lobby') {
+    st('wait', `<div>คุณเข้าร่วมแล้ว!</div><small>เห็นชื่อ “${esc(v.name)}” บนจอใหญ่ไหม</small>`);
+  } else if (v.state === 'count') {
+    main.innerHTML = `<div class="status big ${v.count.announce ? 'hot' : 'wait'}"><small>ข้อ ${v.q + 1} / ${v.total}</small>
+      ${v.count.announce ? '<div id="pann"><small>⚡ ข้อสุดท้าย ⚡</small><div class="pann-x2">×2</div><div>คะแนนคูณ 2<br>เตรียมตัว!!</div></div>' : ''}
+      <div class="pcdn" id="pcdn"></div></div>`;
+    runCount(v.count.ms, v.count.announce, n => {
+      const el = $('#pcdn'); if (!el) return;
+      if (n === 'announce') { SFX.alert(); buzz([120, 60, 120, 60, 240]); return; }
+      const pa = $('#pann'); if (pa) pa.style.display = 'none';
+      el.innerHTML = '<span>' + n + '</span>'; SFX.beep(); buzz(40);
+    });
+  } else if (v.state === 'intro') {
+    (v.question.optImg || []).forEach(u => { if (u) new Image().src = u; });
+    st('wait', `<small>ข้อ ${v.q + 1} / ${v.total}</small><div>เตรียมตัว!</div><div class="spin"></div>`);
+  } else if (v.state === 'question') {
+    if (myAnswer == null) {
+      const qn = v.question;
+      main.innerHTML = `<div class="timer"><i id="bar"></i></div>
+        <div class="player-question" role="heading" aria-level="2"><span class="player-question-label">ข้อ ${v.q + 1} / ${v.total}</span><div class="player-question-text">${esc(qn.text || '')}</div></div>
+        <div class="answers big">${qn.options.map((o, i) => tile(o, (qn.optImg || [])[i], i)).join('')}</div>`;
+      runTimer($('#bar'), null, v.question.ms, v.question.time * 1000);
+      main.querySelectorAll('.ans').forEach(b => b.onclick = () => {
+        const i = +b.dataset.i; myAnswer = i; SFX.click(); buzz(30); render();
+        socket.emit('player:answer', i, () => {});
+      });
+    } else {
+      const mo = (v.question.options || [])[myAnswer] || '';
+      st('wait', `<span style="font-size:4.5rem;color:var(--a${myAnswer})">${SHAPES[myAnswer]}</span><div>ส่งคำตอบแล้ว</div>${mo ? `<small>${esc(mo)}</small>` : ''}<small>รอเพื่อน ๆ ตอบ...</small>`);
+    }
+  } else if (v.state === 'reveal' || v.state === 'board') {
+    const r = v.result || {};
+    const behind = v.rank === 1 ? 'คุณนำอยู่อันดับ 1!' : (v.behind ? `ตามหลัง ${esc(v.behind.name)} อยู่ ${v.behind.gap} คะแนน` : '');
+    main.innerHTML = `<div class="status big ${r.correct ? 'ok' : 'no'}"><div>${r.correct ? 'ถูกต้อง ✓' : (r.answered ? 'ยังไม่ถูก ✗' : 'หมดเวลา ✗')}</div>
+      ${r.correct ? `<small>+${r.points} คะแนน</small>` : ''}${r.streak > 1 ? `<small>🔥 ถูกติดกัน ${r.streak} ข้อ</small>` : ''}${r.mult > 1 && r.correct ? '<small>⚡ ข้อสุดท้าย คะแนน ×2</small>' : ''}</div>
+      <div class="card center"><div class="muted">คะแนนรวม</div><div class="score">${v.score}</div><div><b>อันดับ ${v.rank}</b> จาก ${v.of}</div>${behind ? `<div class="muted" style="margin-top:6px">${behind}</div>` : ''}</div>`;
+  } else if (v.state === 'final') {
+    const key = 'qp_fin_' + saved.pin;
+    let t0 = +sessionStorage.getItem(key);
+    if (!t0) { t0 = Date.now(); sessionStorage.setItem(key, t0); }
+    const wait = podiumTimes(Math.min(3, v.of)).last + 900 - (Date.now() - t0);
+    if (wait > 0) {
+      st('wait', `<div class="drum-emoji">🥁</div><div>กำลังประกาศผล...</div><small>ดูที่จอใหญ่!</small>`);
+      finTimer = setTimeout(render, wait);
+    } else {
+      main.innerHTML = `<div class="status big ok"><small>จบเกม · ${esc(v.name)}</small><div>${v.rank <= 3 ? ['🥇', '🥈', '🥉'][v.rank - 1] + ' ' : ''}อันดับ ${v.rank}</div><small>จาก ${v.of} คน</small></div>
+        <div class="card center"><div class="muted">คะแนนรวม</div><div class="score">${v.score}</div><div>ตอบถูก ${v.correctCount} จาก ${v.total} ข้อ</div></div>`;
+      if (!finFx) {
+        finFx = true;
+        if (v.rank <= 3) { SFX.fanfare(); buzz([100, 50, 100, 50, 250]); FX.cannons(80); FX.rain(4500); }
+        else SFX.reveal();
+      }
+    }
+  }
+}
+</script></body></html>
